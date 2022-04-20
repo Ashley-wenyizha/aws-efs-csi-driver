@@ -38,7 +38,7 @@ import (
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
-	"k8s.io/kubernetes/test/e2e/framework/volume"
+	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
 	"k8s.io/kubernetes/test/e2e/storage/testpatterns"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
 )
@@ -65,7 +65,7 @@ func InitVolumeModeTestSuite() TestSuite {
 				testpatterns.BlockVolModePreprovisionedPV,
 				testpatterns.BlockVolModeDynamicPV,
 			},
-			SupportedSizeRange: volume.SizeRange{
+			SupportedSizeRange: e2evolume.SizeRange{
 				Min: "1Mi",
 			},
 		},
@@ -89,8 +89,7 @@ func (t *volumeModeTestSuite) DefineTests(driver TestDriver, pattern testpattern
 		// VolumeResource contains pv, pvc, sc, etc., owns cleaning that up
 		VolumeResource
 
-		intreeOps   opCounts
-		migratedOps opCounts
+		migrationCheck *migrationOpCheck
 	}
 	var (
 		dInfo = driver.GetDriverInfo()
@@ -112,7 +111,7 @@ func (t *volumeModeTestSuite) DefineTests(driver TestDriver, pattern testpattern
 
 		// Now do the more expensive test initialization.
 		l.config, l.driverCleanup = driver.PrepareTest(f)
-		l.intreeOps, l.migratedOps = getMigrationVolumeOpCounts(f.ClientSet, dInfo.InTreePluginName)
+		l.migrationCheck = newMigrationOpCheck(f.ClientSet, dInfo.InTreePluginName)
 	}
 
 	// manualInit initializes l.VolumeResource without creating the PV & PVC objects.
@@ -183,7 +182,7 @@ func (t *volumeModeTestSuite) DefineTests(driver TestDriver, pattern testpattern
 		errs = append(errs, tryFunc(l.driverCleanup))
 		l.driverCleanup = nil
 		framework.ExpectNoError(errors.NewAggregate(errs), "while cleaning up resource")
-		validateMigrationVolumeOpCounts(f.ClientSet, dInfo.InTreePluginName, l.intreeOps, l.migratedOps)
+		l.migrationCheck.validateMigrationVolumeOpCounts()
 	}
 
 	// We register different tests depending on the drive
@@ -213,9 +212,16 @@ func (t *volumeModeTestSuite) DefineTests(driver TestDriver, pattern testpattern
 				framework.ExpectNoError(e2epv.WaitOnPVandPVC(l.cs, l.ns.Name, l.Pv, l.Pvc), "Failed to bind pv and pvc")
 
 				ginkgo.By("Creating pod")
-				pod := e2epod.MakeSecPod(l.ns.Name, []*v1.PersistentVolumeClaim{l.Pvc}, nil, false, "", false, false, e2epv.SELinuxLabel, nil)
-				// Setting node
-				e2epod.SetNodeSelection(&pod.Spec, l.config.ClientNodeSelection)
+				podConfig := e2epod.Config{
+					NS:            l.ns.Name,
+					PVCs:          []*v1.PersistentVolumeClaim{l.Pvc},
+					SeLinuxLabel:  e2evolume.GetLinuxLabel(),
+					NodeSelection: l.config.ClientNodeSelection,
+					ImageID:       e2evolume.GetDefaultTestImageID(),
+				}
+				pod, err := e2epod.MakeSecPod(&podConfig)
+				framework.ExpectNoError(err, "Failed to create pod")
+
 				pod, err = l.cs.CoreV1().Pods(l.ns.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
 				framework.ExpectNoError(err, "Failed to create pod")
 				defer func() {
@@ -245,7 +251,7 @@ func (t *volumeModeTestSuite) DefineTests(driver TestDriver, pattern testpattern
 
 	case testpatterns.DynamicPV:
 		if pattern.VolMode == v1.PersistentVolumeBlock && !isBlockSupported {
-			ginkgo.It("should fail in binding dynamic provisioned PV to PVC [Slow]", func() {
+			ginkgo.It("should fail in binding dynamic provisioned PV to PVC [Slow][LinuxOnly]", func() {
 				manualInit()
 				defer cleanup()
 
@@ -292,7 +298,15 @@ func (t *volumeModeTestSuite) DefineTests(driver TestDriver, pattern testpattern
 
 		ginkgo.By("Creating pod")
 		var err error
-		pod := e2epod.MakeSecPod(l.ns.Name, []*v1.PersistentVolumeClaim{l.Pvc}, nil, false, "", false, false, e2epv.SELinuxLabel, nil)
+		podConfig := e2epod.Config{
+			NS:           l.ns.Name,
+			PVCs:         []*v1.PersistentVolumeClaim{l.Pvc},
+			SeLinuxLabel: e2evolume.GetLinuxLabel(),
+			ImageID:      e2evolume.GetDefaultTestImageID(),
+		}
+		pod, err := e2epod.MakeSecPod(&podConfig)
+		framework.ExpectNoError(err)
+
 		// Change volumeMounts to volumeDevices and the other way around
 		pod = swapVolumeMode(pod)
 
@@ -330,7 +344,7 @@ func (t *volumeModeTestSuite) DefineTests(driver TestDriver, pattern testpattern
 		framework.ExpectEqual(p.Status.Phase, v1.PodPending, "Pod phase isn't pending")
 	})
 
-	ginkgo.It("should not mount / map unused volumes in a pod", func() {
+	ginkgo.It("should not mount / map unused volumes in a pod [LinuxOnly]", func() {
 		if pattern.VolMode == v1.PersistentVolumeBlock {
 			skipTestIfBlockNotSupported(driver)
 		}
@@ -341,7 +355,15 @@ func (t *volumeModeTestSuite) DefineTests(driver TestDriver, pattern testpattern
 
 		ginkgo.By("Creating pod")
 		var err error
-		pod := e2epod.MakeSecPod(l.ns.Name, []*v1.PersistentVolumeClaim{l.Pvc}, nil, false, "", false, false, e2epv.SELinuxLabel, nil)
+		podConfig := e2epod.Config{
+			NS:           l.ns.Name,
+			PVCs:         []*v1.PersistentVolumeClaim{l.Pvc},
+			SeLinuxLabel: e2evolume.GetLinuxLabel(),
+			ImageID:      e2evolume.GetDefaultTestImageID(),
+		}
+		pod, err := e2epod.MakeSecPod(&podConfig)
+		framework.ExpectNoError(err)
+
 		for i := range pod.Spec.Containers {
 			pod.Spec.Containers[i].VolumeDevices = nil
 			pod.Spec.Containers[i].VolumeMounts = nil

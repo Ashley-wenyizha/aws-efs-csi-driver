@@ -39,7 +39,7 @@ import (
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
-	"k8s.io/kubernetes/test/e2e/framework/volume"
+	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
 	"k8s.io/kubernetes/test/e2e/storage/testpatterns"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
 )
@@ -71,7 +71,7 @@ func InitVolumeIOTestSuite() TestSuite {
 				testpatterns.DefaultFsPreprovisionedPV,
 				testpatterns.DefaultFsDynamicPV,
 			},
-			SupportedSizeRange: volume.SizeRange{
+			SupportedSizeRange: e2evolume.SizeRange{
 				Min: "1Mi",
 			},
 		},
@@ -95,8 +95,7 @@ func (t *volumeIOTestSuite) DefineTests(driver TestDriver, pattern testpatterns.
 
 		resource *VolumeResource
 
-		intreeOps   opCounts
-		migratedOps opCounts
+		migrationCheck *migrationOpCheck
 	}
 	var (
 		dInfo = driver.GetDriverInfo()
@@ -116,7 +115,7 @@ func (t *volumeIOTestSuite) DefineTests(driver TestDriver, pattern testpatterns.
 
 		// Now do the more expensive test initialization.
 		l.config, l.driverCleanup = driver.PrepareTest(f)
-		l.intreeOps, l.migratedOps = getMigrationVolumeOpCounts(f.ClientSet, dInfo.InTreePluginName)
+		l.migrationCheck = newMigrationOpCheck(f.ClientSet, dInfo.InTreePluginName)
 
 		testVolumeSizeRange := t.GetTestSuiteInfo().SupportedSizeRange
 		l.resource = CreateVolumeResource(driver, l.config, pattern, testVolumeSizeRange)
@@ -139,10 +138,10 @@ func (t *volumeIOTestSuite) DefineTests(driver TestDriver, pattern testpatterns.
 		}
 
 		framework.ExpectNoError(errors.NewAggregate(errs), "while cleaning up resource")
-		validateMigrationVolumeOpCounts(f.ClientSet, dInfo.InTreePluginName, l.intreeOps, l.migratedOps)
+		l.migrationCheck.validateMigrationVolumeOpCounts()
 	}
 
-	ginkgo.It("should write files of various sizes, verify size, validate content [Slow]", func() {
+	ginkgo.It("should write files of various sizes, verify size, validate content [Slow][LinuxOnly]", func() {
 		init()
 		defer cleanup()
 
@@ -180,7 +179,7 @@ func createFileSizes(maxFileSize int64) []int64 {
 }
 
 // Return the plugin's client pod spec. Use an InitContainer to setup the file i/o test env.
-func makePodSpec(config volume.TestConfig, initCmd string, volsrc v1.VolumeSource, podSecContext *v1.PodSecurityContext) *v1.Pod {
+func makePodSpec(config e2evolume.TestConfig, initCmd string, volsrc v1.VolumeSource, podSecContext *v1.PodSecurityContext) *v1.Pod {
 	var gracePeriod int64 = 1
 	volName := fmt.Sprintf("io-volume-%s", config.Namespace)
 	pod := &v1.Pod{
@@ -198,7 +197,7 @@ func makePodSpec(config volume.TestConfig, initCmd string, volsrc v1.VolumeSourc
 			InitContainers: []v1.Container{
 				{
 					Name:  config.Prefix + "-io-init",
-					Image: framework.BusyBoxImage,
+					Image: e2evolume.GetDefaultTestImage(),
 					Command: []string{
 						"/bin/sh",
 						"-c",
@@ -215,7 +214,7 @@ func makePodSpec(config volume.TestConfig, initCmd string, volsrc v1.VolumeSourc
 			Containers: []v1.Container{
 				{
 					Name:  config.Prefix + "-io-client",
-					Image: framework.BusyBoxImage,
+					Image: e2evolume.GetDefaultTestImage(),
 					Command: []string{
 						"/bin/sh",
 						"-c",
@@ -250,17 +249,19 @@ func writeToFile(f *framework.Framework, pod *v1.Pod, fpath, ddInput string, fsi
 	ginkgo.By(fmt.Sprintf("writing %d bytes to test file %s", fsize, fpath))
 	loopCnt := fsize / testpatterns.MinFileSize
 	writeCmd := fmt.Sprintf("i=0; while [ $i -lt %d ]; do dd if=%s bs=%d >>%s 2>/dev/null; let i+=1; done", loopCnt, ddInput, testpatterns.MinFileSize, fpath)
-	_, err := utils.PodExec(f, pod, writeCmd)
-
+	stdout, stderr, err := utils.PodExec(f, pod, writeCmd)
+	if err != nil {
+		return fmt.Errorf("error writing to volume using %q: %s\nstdout: %s\nstderr: %s", writeCmd, err, stdout, stderr)
+	}
 	return err
 }
 
 // Verify that the test file is the expected size and contains the expected content.
 func verifyFile(f *framework.Framework, pod *v1.Pod, fpath string, expectSize int64, ddInput string) error {
 	ginkgo.By("verifying file size")
-	rtnstr, err := utils.PodExec(f, pod, fmt.Sprintf("stat -c %%s %s", fpath))
+	rtnstr, stderr, err := utils.PodExec(f, pod, fmt.Sprintf("stat -c %%s %s", fpath))
 	if err != nil || rtnstr == "" {
-		return fmt.Errorf("unable to get file size via `stat %s`: %v", fpath, err)
+		return fmt.Errorf("unable to get file size via `stat %s`: %v\nstdout: %s\nstderr: %s", fpath, err, rtnstr, stderr)
 	}
 	size, err := strconv.Atoi(strings.TrimSuffix(rtnstr, "\n"))
 	if err != nil {
@@ -271,9 +272,9 @@ func verifyFile(f *framework.Framework, pod *v1.Pod, fpath string, expectSize in
 	}
 
 	ginkgo.By("verifying file hash")
-	rtnstr, err = utils.PodExec(f, pod, fmt.Sprintf("md5sum %s | cut -d' ' -f1", fpath))
+	rtnstr, stderr, err = utils.PodExec(f, pod, fmt.Sprintf("md5sum %s | cut -d' ' -f1", fpath))
 	if err != nil {
-		return fmt.Errorf("unable to test file hash via `md5sum %s`: %v", fpath, err)
+		return fmt.Errorf("unable to test file hash via `md5sum %s`: %v\nstdout: %s\nstderr: %s", fpath, err, rtnstr, stderr)
 	}
 	actualHash := strings.TrimSuffix(rtnstr, "\n")
 	expectedHash, ok := md5hashes[expectSize]
@@ -292,10 +293,10 @@ func verifyFile(f *framework.Framework, pod *v1.Pod, fpath string, expectSize in
 // Delete `fpath` to save some disk space on host. Delete errors are logged but ignored.
 func deleteFile(f *framework.Framework, pod *v1.Pod, fpath string) {
 	ginkgo.By(fmt.Sprintf("deleting test file %s...", fpath))
-	_, err := utils.PodExec(f, pod, fmt.Sprintf("rm -f %s", fpath))
+	stdout, stderr, err := utils.PodExec(f, pod, fmt.Sprintf("rm -f %s", fpath))
 	if err != nil {
 		// keep going, the test dir will be deleted when the volume is unmounted
-		framework.Logf("unable to delete test file %s: %v\nerror ignored, continuing test", fpath, err)
+		framework.Logf("unable to delete test file %s: %v\nerror ignored, continuing test\nstdout: %s\nstderr: %s", fpath, err, stdout, stderr)
 	}
 }
 
@@ -305,7 +306,7 @@ func deleteFile(f *framework.Framework, pod *v1.Pod, fpath string) {
 // Note: nil can be passed for the podSecContext parm, in which case it is ignored.
 // Note: `fsizes` values are enforced to each be at least `MinFileSize` and a multiple of `MinFileSize`
 //   bytes.
-func testVolumeIO(f *framework.Framework, cs clientset.Interface, config volume.TestConfig, volsrc v1.VolumeSource, podSecContext *v1.PodSecurityContext, file string, fsizes []int64) (err error) {
+func testVolumeIO(f *framework.Framework, cs clientset.Interface, config e2evolume.TestConfig, volsrc v1.VolumeSource, podSecContext *v1.PodSecurityContext, file string, fsizes []int64) (err error) {
 	ddInput := filepath.Join(mountPath, fmt.Sprintf("%s-%s-dd_if", config.Prefix, config.Namespace))
 	writeBlk := strings.Repeat("abcdefghijklmnopqrstuvwxyz123456", 32) // 1KiB value
 	loopCnt := testpatterns.MinFileSize / int64(len(writeBlk))
@@ -333,7 +334,7 @@ func testVolumeIO(f *framework.Framework, cs clientset.Interface, config volume.
 			}
 		} else {
 			framework.Logf("sleeping a bit so kubelet can unmount and detach the volume")
-			time.Sleep(volume.PodCleanupTimeout)
+			time.Sleep(e2evolume.PodCleanupTimeout)
 		}
 	}()
 

@@ -34,6 +34,7 @@ import (
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
 	"k8s.io/kubernetes/test/e2e/storage/testpatterns"
 )
 
@@ -45,8 +46,7 @@ type topologyTest struct {
 	config        *PerTestConfig
 	driverCleanup func()
 
-	intreeOps   opCounts
-	migratedOps opCounts
+	migrationCheck *migrationOpCheck
 
 	resource      VolumeResource
 	pod           *v1.Pod
@@ -148,7 +148,7 @@ func (t *topologyTestSuite) DefineTests(driver TestDriver, pattern testpatterns.
 			StorageClassName: &(l.resource.Sc.Name),
 		}, l.config.Framework.Namespace.Name)
 
-		l.intreeOps, l.migratedOps = getMigrationVolumeOpCounts(f.ClientSet, dInfo.InTreePluginName)
+		l.migrationCheck = newMigrationOpCheck(f.ClientSet, dInfo.InTreePluginName)
 		return l
 	}
 
@@ -158,7 +158,7 @@ func (t *topologyTestSuite) DefineTests(driver TestDriver, pattern testpatterns.
 		l.driverCleanup = nil
 		framework.ExpectNoError(err, "while cleaning up driver")
 
-		validateMigrationVolumeOpCounts(f.ClientSet, dInfo.InTreePluginName, l.intreeOps, l.migratedOps)
+		l.migrationCheck.validateMigrationVolumeOpCounts()
 	}
 
 	ginkgo.It("should provision a volume and schedule a pod with AllowedTopologies", func() {
@@ -333,16 +333,15 @@ func (t *topologyTestSuite) createResources(cs clientset.Interface, l *topologyT
 	framework.ExpectNoError(err)
 
 	ginkgo.By("Creating pod")
-	l.pod = e2epod.MakeSecPod(l.config.Framework.Namespace.Name,
-		[]*v1.PersistentVolumeClaim{l.resource.Pvc},
-		nil,
-		false,
-		"",
-		false,
-		false,
-		e2epv.SELinuxLabel,
-		nil)
-	l.pod.Spec.Affinity = affinity
+	podConfig := e2epod.Config{
+		NS:            l.config.Framework.Namespace.Name,
+		PVCs:          []*v1.PersistentVolumeClaim{l.resource.Pvc},
+		NodeSelection: e2epod.NodeSelection{Affinity: affinity},
+		SeLinuxLabel:  e2evolume.GetLinuxLabel(),
+		ImageID:       e2evolume.GetDefaultTestImageID(),
+	}
+	l.pod, err = e2epod.MakeSecPod(&podConfig)
+	framework.ExpectNoError(err)
 	l.pod, err = cs.CoreV1().Pods(l.pod.Namespace).Create(context.TODO(), l.pod, metav1.CreateOptions{})
 	framework.ExpectNoError(err)
 }

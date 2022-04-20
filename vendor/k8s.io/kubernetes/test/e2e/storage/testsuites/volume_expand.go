@@ -32,9 +32,8 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
-	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
-	"k8s.io/kubernetes/test/e2e/framework/volume"
+	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
 	"k8s.io/kubernetes/test/e2e/storage/testpatterns"
 )
 
@@ -42,6 +41,12 @@ const (
 	resizePollInterval = 2 * time.Second
 	// total time to wait for cloudprovider or file system resize to finish
 	totalResizeWaitPeriod = 10 * time.Minute
+
+	// resizedPodStartupTimeout defines time we should wait for pod that uses offline
+	// resized volume to startup. This time is higher than default PodStartTimeout because
+	// typically time to detach and then attach a volume is amortized in this time duration.
+	resizedPodStartupTimeout = 10 * time.Minute
+
 	// time to wait for PVC conditions to sync
 	pvcConditionSyncPeriod = 2 * time.Minute
 )
@@ -62,9 +67,11 @@ func InitVolumeExpandTestSuite() TestSuite {
 				testpatterns.BlockVolModeDynamicPV,
 				testpatterns.DefaultFsDynamicPVAllowExpansion,
 				testpatterns.BlockVolModeDynamicPVAllowExpansion,
+				testpatterns.NtfsDynamicPV,
+				testpatterns.NtfsDynamicPVAllowExpansion,
 			},
-			SupportedSizeRange: volume.SizeRange{
-				Min: "1Mi",
+			SupportedSizeRange: e2evolume.SizeRange{
+				Min: "1Gi",
 			},
 		},
 	}
@@ -86,8 +93,7 @@ func (v *volumeExpandTestSuite) DefineTests(driver TestDriver, pattern testpatte
 		pod      *v1.Pod
 		pod2     *v1.Pod
 
-		intreeOps   opCounts
-		migratedOps opCounts
+		migrationCheck *migrationOpCheck
 	}
 	var l local
 
@@ -112,7 +118,7 @@ func (v *volumeExpandTestSuite) DefineTests(driver TestDriver, pattern testpatte
 
 		// Now do the more expensive test initialization.
 		l.config, l.driverCleanup = driver.PrepareTest(f)
-		l.intreeOps, l.migratedOps = getMigrationVolumeOpCounts(f.ClientSet, driver.GetDriverInfo().InTreePluginName)
+		l.migrationCheck = newMigrationOpCheck(f.ClientSet, driver.GetDriverInfo().InTreePluginName)
 		testVolumeSizeRange := v.GetTestSuiteInfo().SupportedSizeRange
 		l.resource = CreateVolumeResource(driver, l.config, pattern, testVolumeSizeRange)
 	}
@@ -141,7 +147,7 @@ func (v *volumeExpandTestSuite) DefineTests(driver TestDriver, pattern testpatte
 		errs = append(errs, tryFunc(l.driverCleanup))
 		l.driverCleanup = nil
 		framework.ExpectNoError(errors.NewAggregate(errs), "while cleaning up resource")
-		validateMigrationVolumeOpCounts(f.ClientSet, driver.GetDriverInfo().InTreePluginName, l.intreeOps, l.migratedOps)
+		l.migrationCheck.validateMigrationVolumeOpCounts()
 	}
 
 	if !pattern.AllowExpansion {
@@ -166,7 +172,14 @@ func (v *volumeExpandTestSuite) DefineTests(driver TestDriver, pattern testpatte
 
 			var err error
 			ginkgo.By("Creating a pod with dynamically provisioned volume")
-			l.pod, err = e2epod.CreateSecPodWithNodeSelection(f.ClientSet, f.Namespace.Name, []*v1.PersistentVolumeClaim{l.resource.Pvc}, nil, false, "", false, false, e2epv.SELinuxLabel, nil, l.config.ClientNodeSelection, framework.PodStartTimeout)
+			podConfig := e2epod.Config{
+				NS:            f.Namespace.Name,
+				PVCs:          []*v1.PersistentVolumeClaim{l.resource.Pvc},
+				SeLinuxLabel:  e2evolume.GetLinuxLabel(),
+				NodeSelection: l.config.ClientNodeSelection,
+				ImageID:       e2evolume.GetDefaultTestImageID(),
+			}
+			l.pod, err = e2epod.CreateSecPodWithNodeSelection(f.ClientSet, &podConfig, framework.PodStartTimeout)
 			defer func() {
 				err = e2epod.DeletePodWithWait(f.ClientSet, l.pod)
 				framework.ExpectNoError(err, "while cleaning up pod already deleted in resize test")
@@ -203,7 +216,14 @@ func (v *volumeExpandTestSuite) DefineTests(driver TestDriver, pattern testpatte
 			l.resource.Pvc = npvc
 
 			ginkgo.By("Creating a new pod with same volume")
-			l.pod2, err = e2epod.CreateSecPodWithNodeSelection(f.ClientSet, f.Namespace.Name, []*v1.PersistentVolumeClaim{l.resource.Pvc}, nil, false, "", false, false, e2epv.SELinuxLabel, nil, l.config.ClientNodeSelection, framework.PodStartTimeout)
+			podConfig = e2epod.Config{
+				NS:            f.Namespace.Name,
+				PVCs:          []*v1.PersistentVolumeClaim{l.resource.Pvc},
+				SeLinuxLabel:  e2evolume.GetLinuxLabel(),
+				NodeSelection: l.config.ClientNodeSelection,
+				ImageID:       e2evolume.GetDefaultTestImageID(),
+			}
+			l.pod2, err = e2epod.CreateSecPodWithNodeSelection(f.ClientSet, &podConfig, resizedPodStartupTimeout)
 			defer func() {
 				err = e2epod.DeletePodWithWait(f.ClientSet, l.pod2)
 				framework.ExpectNoError(err, "while cleaning up pod before exiting resizing test")
@@ -224,14 +244,21 @@ func (v *volumeExpandTestSuite) DefineTests(driver TestDriver, pattern testpatte
 
 			var err error
 			ginkgo.By("Creating a pod with dynamically provisioned volume")
-			l.pod, err = e2epod.CreateSecPodWithNodeSelection(f.ClientSet, f.Namespace.Name, []*v1.PersistentVolumeClaim{l.resource.Pvc}, nil, false, "", false, false, e2epv.SELinuxLabel, nil, l.config.ClientNodeSelection, framework.PodStartTimeout)
+			podConfig := e2epod.Config{
+				NS:            f.Namespace.Name,
+				PVCs:          []*v1.PersistentVolumeClaim{l.resource.Pvc},
+				SeLinuxLabel:  e2evolume.GetLinuxLabel(),
+				NodeSelection: l.config.ClientNodeSelection,
+				ImageID:       e2evolume.GetDefaultTestImageID(),
+			}
+			l.pod, err = e2epod.CreateSecPodWithNodeSelection(f.ClientSet, &podConfig, framework.PodStartTimeout)
 			defer func() {
 				err = e2epod.DeletePodWithWait(f.ClientSet, l.pod)
 				framework.ExpectNoError(err, "while cleaning up pod already deleted in resize test")
 			}()
 			framework.ExpectNoError(err, "While creating pods for resizing")
 
-			// We expand the PVC while no pod is using it to ensure offline expansion
+			// We expand the PVC while l.pod is using it for online expansion.
 			ginkgo.By("Expanding current pvc")
 			currentPvcSize := l.resource.Pvc.Spec.Resources.Requests[v1.ResourceStorage]
 			newSize := currentPvcSize.DeepCopy()

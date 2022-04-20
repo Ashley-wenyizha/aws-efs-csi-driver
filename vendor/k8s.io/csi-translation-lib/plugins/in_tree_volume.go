@@ -24,7 +24,6 @@ import (
 	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
-	cloudvolume "k8s.io/cloud-provider/volume"
 )
 
 // InTreePlugin handles translations between CSI and in-tree sources in a PV
@@ -37,7 +36,8 @@ type InTreePlugin interface {
 	// TranslateInTreeInlineVolumeToCSI takes a inline volume and will translate
 	// the in-tree inline volume source to a CSIPersistentVolumeSource
 	// A PV object containing the CSIPersistentVolumeSource in it's spec is returned
-	TranslateInTreeInlineVolumeToCSI(volume *v1.Volume) (*v1.PersistentVolume, error)
+	// podNamespace is only needed for azurefile to fetch secret namespace, no need to be set for other plugins.
+	TranslateInTreeInlineVolumeToCSI(volume *v1.Volume, podNamespace string) (*v1.PersistentVolume, error)
 
 	// TranslateInTreePVToCSI takes a persistent volume and will translate
 	// the in-tree pv source to a CSI Source. The input persistent volume can be modified
@@ -151,13 +151,13 @@ func translateTopology(pv *v1.PersistentVolume, topologyKey string) error {
 		return nil
 	}
 
-	zones := getTopologyZones(pv, v1.LabelZoneFailureDomain)
+	zones := getTopologyZones(pv, v1.LabelFailureDomainBetaZone)
 	if len(zones) > 0 {
-		return replaceTopology(pv, v1.LabelZoneFailureDomain, topologyKey)
+		return replaceTopology(pv, v1.LabelFailureDomainBetaZone, topologyKey)
 	}
 
-	if label, ok := pv.Labels[v1.LabelZoneFailureDomain]; ok {
-		zones = strings.Split(label, cloudvolume.LabelMultiZoneDelimiter)
+	if label, ok := pv.Labels[v1.LabelFailureDomainBetaZone]; ok {
+		zones = strings.Split(label, labelMultiZoneDelimiter)
 		if len(zones) > 0 {
 			return addTopology(pv, topologyKey, zones)
 		}
@@ -178,7 +178,7 @@ func translateAllowedTopologies(terms []v1.TopologySelectorTerm, key string) ([]
 		newTerm := v1.TopologySelectorTerm{}
 		for _, exp := range term.MatchLabelExpressions {
 			var newExp v1.TopologySelectorLabelRequirement
-			if exp.Key == v1.LabelZoneFailureDomain {
+			if exp.Key == v1.LabelFailureDomainBetaZone {
 				newExp = v1.TopologySelectorLabelRequirement{
 					Key:    key,
 					Values: exp.Values,
