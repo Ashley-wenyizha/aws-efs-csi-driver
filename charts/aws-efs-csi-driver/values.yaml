@@ -11,26 +11,26 @@ useFIPS: false
 
 image:
   repository: amazon/aws-efs-csi-driver
-  tag: "v1.5.4"
+  tag: "v1.5.5"
   pullPolicy: IfNotPresent
 
 sidecars:
   livenessProbe:
     image:
       repository: public.ecr.aws/eks-distro/kubernetes-csi/livenessprobe
-      tag: v2.8.0-eks-1-25-latest
+      tag: v2.9.0-eks-1-27-latest
       pullPolicy: IfNotPresent
     resources: {}
   nodeDriverRegistrar:
     image:
       repository: public.ecr.aws/eks-distro/kubernetes-csi/node-driver-registrar
-      tag: v2.6.2-eks-1-25-latest
+      tag: v2.7.0-eks-1-27-latest
       pullPolicy: IfNotPresent
     resources: {}
   csiProvisioner:
     image:
       repository: public.ecr.aws/eks-distro/kubernetes-csi/external-provisioner
-      tag: v3.3.0-eks-1-25-latest
+      tag: v3.4.0-eks-1-27-latest
       pullPolicy: IfNotPresent
     resources: {}
 
@@ -119,6 +119,15 @@ node:
     # type: OnDelete
   tolerations:
     - operator: Exists
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: eks.amazonaws.com/compute-type
+                operator: NotIn
+                values:
+                  - fargate
   # Specifies whether a service account should be created
   serviceAccount:
     create: true
